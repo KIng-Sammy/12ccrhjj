@@ -1,0 +1,14 @@
+{
+  "name": "restaurant-leads-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Run gosom/google-maps-scraper on GitHub Actions and load restaurant leads into MongoDB.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "load": "node scripts/to-mongo.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.8.0"
+  }
+}

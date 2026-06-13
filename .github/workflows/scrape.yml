@@ -1,0 +1,76 @@
+name: Scrape restaurant leads
+
+# Run on demand from the Actions tab. Fill in the query + options each run.
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Search (use ; to separate several, e.g. "restaurants in Lagos; cafes in Ikeja")'
+        required: true
+        default: 'restaurants in Lagos, Nigeria'
+      depth:
+        description: 'Scroll depth — higher = more results per query (10 ≈ a lot)'
+        required: false
+        default: '10'
+      lang:
+        description: 'Language code'
+        required: false
+        default: 'en'
+      email:
+        description: 'Extract emails from each website (slower but great for outreach)'
+        required: false
+        default: 'true'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build query file
+        run: |
+          echo "${{ github.event.inputs.query }}" | tr ';' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' > queries.txt
+          echo "Queries:" && cat queries.txt
+          mkdir -p out
+
+      - name: Run Google Maps scraper
+        run: |
+          EMAIL_FLAG=""
+          if [ "${{ github.event.inputs.email }}" = "true" ]; then EMAIL_FLAG="-email"; fi
+          docker run --rm \
+            -v "$PWD/queries.txt:/queries.txt:ro" \
+            -v "$PWD/out:/out" \
+            gosom/google-maps-scraper \
+            -input /queries.txt \
+            -results /out/results.json \
+            -json \
+            -depth "${{ github.event.inputs.depth }}" \
+            -lang "${{ github.event.inputs.lang }}" \
+            -exit-on-inactivity 5m \
+            $EMAIL_FLAG
+          echo "Result size:" && wc -c out/results.json || true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install loader deps
+        run: npm install --no-audit --no-fund
+
+      - name: Load leads into MongoDB
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB }}
+          LEADS_QUERY: ${{ github.event.inputs.query }}
+        run: node scripts/to-mongo.js out/results.json
+
+      - name: Upload raw results (copy-paste / download)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leads-results
+          path: out/results.json
+          if-no-files-found: warn
