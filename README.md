@@ -15,17 +15,29 @@ website, **email** (extracted from each site), rating, reviews, address, place i
    - `MONGODB_DB` — database name. *Optional* (defaults to `chef_assist`).
 3. Done. No credit card, no API key.
 
-## Run it
+## Run it (automatic — walks the United States)
 
-- Repo → **Actions** tab → **“Scrape restaurant leads”** → **Run workflow**.
-- Fill in:
-  - **query** — e.g. `restaurants in Lagos, Nigeria` (separate several with `;`).
-  - **depth** — higher = more results per query (start with `10`).
-  - **lang** — `en`.
-  - **email** — `true` to also pull emails from each website (slower, best for outreach).
-- It scrapes, then loads everything into your MongoDB `leads` collection.
-- The raw `results.json` is also attached to the run as a **downloadable artifact**
-  (open it in a spreadsheet for copy-paste outreach).
+This is now wired to sweep the **United States one state at a time**, automatically.
+
+- **Schedule:** runs **3× per day** (cron `13 5,13,21 * * *`, UTC). No clicks needed.
+- **Targets:** every run scrapes the next state — `restaurants in <State>, United States`
+  — using the ordered list in [`scripts/us-states.js`](scripts/us-states.js)
+  (50 states + Washington, D.C.). Progress is tracked in
+  [`state/progress.json`](state/progress.json) and committed back each run, so it
+  picks up exactly where it left off.
+- **Outputs (committed to the repo each run, accumulating + de-duped):**
+  - **`whatsapp.txt`** — one phone / WhatsApp number per line.
+  - **`gmail.txt`** — one email address per line.
+- **MongoDB load is optional now** — it only runs if you set the `MONGODB_URI`
+  secret; otherwise it's skipped. The raw `results.json` is still attached to each
+  run as a **downloadable artifact**.
+- **HARD STOP:** once the **final state** is scraped, the workflow **disables itself**
+  (via `gh workflow disable`) so it stops running. To run it again, re-enable it in
+  the Actions tab and reset `state/progress.json` back to `{"index": 0}`.
+
+You can still trigger it manually from **Actions → “Scrape restaurant leads” → Run
+workflow** (depth / lang / email are adjustable there); the target state is always
+chosen automatically from progress.
 
 ## What lands in MongoDB (`leads` collection)
 

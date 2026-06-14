@@ -1,15 +1,17 @@
 name: Scrape restaurant leads
 
-# Run on demand from the Actions tab. Fill in the query + options each run.
+# Walks the United States one state at a time (see scripts/us-states.js + the
+# committed state/progress.json pointer). Runs automatically 3x/day, and HARD
+# STOPS — disables itself — once the final state has been scraped.
 on:
+  schedule:
+    # 3x a day (UTC): ~05:13, 13:13, 21:13. Off-the-hour on purpose.
+    - cron: '13 5,13,21 * * *'
+  # Still runnable on demand. Query is chosen automatically from progress.
   workflow_dispatch:
     inputs:
-      query:
-        description: 'Search (use ; to separate several, e.g. "restaurants in Lagos; cafes in Ikeja")'
-        required: true
-        default: 'restaurants in Lagos, Nigeria'
       depth:
-        description: 'Scroll depth — higher = more results per query (10 ≈ a lot)'
+        description: 'Scroll depth — higher = more results per query'
         required: false
         default: '10'
       lang:
@@ -21,24 +23,62 @@ on:
         required: false
         default: 'true'
 
+# Need to push the updated files (whatsapp.txt / gmail.txt / progress) and to
+# disable this workflow when the country is done.
+permissions:
+  contents: write
+  actions: write
+
+# Never let two runs overlap and corrupt the progress pointer.
+concurrency:
+  group: scrape-us
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      DEPTH: ${{ github.event.inputs.depth || '10' }}
+      LANG_CODE: ${{ github.event.inputs.lang || 'en' }}
+      EMAIL: ${{ github.event.inputs.email || 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build query file
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Pick next US state
+        id: pick
+        run: node scripts/pick-state.js
+
+      # ── HARD STOP: every state already scraped ───────────────────────────────
+      - name: All states done — disable workflow (hard stop)
+        if: steps.pick.outputs.done == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ github.event.inputs.query }}" | tr ';' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' > queries.txt
+          echo "::notice::United States fully scraped. Disabling workflow (hard stop)."
+          gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
+            gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
+
+      # ── Normal run: scrape the current state ─────────────────────────────────
+      - name: Build query file
+        if: steps.pick.outputs.done == 'false'
+        run: |
+          echo "Target: ${{ steps.pick.outputs.state }} (index ${{ steps.pick.outputs.index }})"
+          echo "${{ steps.pick.outputs.query }}" > queries.txt
           echo "Queries:" && cat queries.txt
           mkdir -p out
 
       - name: Run Google Maps scraper
+        if: steps.pick.outputs.done == 'false'
         run: |
           EMAIL_FLAG=""
-          if [ "${{ github.event.inputs.email }}" = "true" ]; then EMAIL_FLAG="-email"; fi
+          if [ "$EMAIL" = "true" ]; then EMAIL_FLAG="-email"; fi
           docker run --rm \
             -v "$PWD/queries.txt:/queries.txt:ro" \
             -v "$PWD/out:/out" \
@@ -46,31 +86,65 @@ jobs:
             -input /queries.txt \
             -results /out/results.json \
             -json \
-            -depth "${{ github.event.inputs.depth }}" \
-            -lang "${{ github.event.inputs.lang }}" \
+            -depth "$DEPTH" \
+            -lang "$LANG_CODE" \
             -exit-on-inactivity 5m \
             $EMAIL_FLAG
           echo "Result size:" && wc -c out/results.json || true
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Install loader deps
+        if: steps.pick.outputs.done == 'false'
         run: npm install --no-audit --no-fund
 
-      - name: Load leads into MongoDB
+      - name: Load leads into MongoDB (optional)
+        if: steps.pick.outputs.done == 'false'
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_DB: ${{ secrets.MONGODB_DB }}
-          LEADS_QUERY: ${{ github.event.inputs.query }}
-        run: node scripts/to-mongo.js out/results.json
+          LEADS_QUERY: ${{ steps.pick.outputs.query }}
+        run: |
+          if [ -z "$MONGODB_URI" ]; then
+            echo "MONGODB_URI not set — skipping MongoDB load."
+            exit 0
+          fi
+          node scripts/to-mongo.js out/results.json
 
-      - name: Upload raw results (copy-paste / download)
-        if: always()
+      - name: Extract phones → whatsapp.txt and emails → gmail.txt
+        if: steps.pick.outputs.done == 'false'
+        run: node scripts/extract.js out/results.json
+
+      - name: Advance progress pointer
+        id: adv
+        if: steps.pick.outputs.done == 'false'
+        run: node scripts/advance.js
+
+      - name: Commit outreach files + progress
+        if: steps.pick.outputs.done == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add whatsapp.txt gmail.txt state/progress.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "leads: ${{ steps.pick.outputs.state }} (state ${{ steps.pick.outputs.index }})"
+            git push
+          fi
+
+      - name: Upload raw results (download)
+        if: always() && steps.pick.outputs.done == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: leads-results
+          name: leads-${{ steps.pick.outputs.state || 'run' }}
           path: out/results.json
           if-no-files-found: warn
+
+      # ── HARD STOP: that was the final state ──────────────────────────────────
+      - name: Last state finished — disable workflow (hard stop)
+        if: steps.adv.outputs.last == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::notice::Final state (${{ steps.adv.outputs.finished }}) scraped. Disabling workflow (hard stop)."
+          gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
+            gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
