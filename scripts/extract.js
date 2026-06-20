@@ -1,21 +1,33 @@
 /**
  * Split scraped results into two outreach files:
- *   whatsapp.txt - one phone / WhatsApp number per line
- *   gmail.txt    - one email address per line
+ *   whatsapp.txt  — phone numbers, organized by run  (DAY 1, DAY 2, …)
+ *   gmail.txt     — email addresses, organized by run (DAY 1, DAY 2, …)
  *
- * Both files accumulate across runs (one state per run) and are de-duplicated, so
- * the final files hold every unique number / email gathered across the whole
- * United States. New entries are appended; existing entries are never duplicated.
+ * Each time this script runs it appends a new "DAY N" section with only the
+ * NEW entries found in that run. Entries already present in the file (from any
+ * prior day) are silently skipped — no duplicates across days.
+ *
+ * Email filters (entries that fail any check are dropped):
+ *   ✗ longer than 32 characters
+ *   ✗ ends with .png / .jpg / .jpeg / .gif / .webp / .svg / .bmp / .ico
+ *   ✗ does not contain exactly one "@" with a domain after it
+ *
+ * Phone filters:
+ *   ✗ fewer than 7 digits after stripping non-numeric characters
  *
  * Usage: node scripts/extract.js out/results.json
  */
 import fs from 'node:fs';
 
 const file = process.argv[2] || 'out/results.json';
-const WHATSAPP_FILE = 'whatsapp.txt';
-const GMAIL_FILE = 'gmail.txt';
+// Per-country output files, chosen by pick-target.js via filesFor(country) and
+// passed in through the environment. Defaults keep the original US filenames.
+const WHATSAPP_FILE = process.env.PHONES_FILE || 'whatsapp.txt';
+const GMAIL_FILE    = process.env.EMAILS_FILE || 'gmail.txt';
 
-/** The scraper may emit a JSON array OR newline-delimited JSON. Handle both. */
+// ── Parsers ──────────────────────────────────────────────────────────────────
+
+/** Handle both JSON-array and newline-delimited JSON output from the scraper. */
 function parseResults(raw) {
   const text = raw.trim();
   if (!text) return [];
@@ -25,33 +37,63 @@ function parseResults(raw) {
   } catch {
     return text
       .split('\n')
-      .map((l) => l.trim())
+      .map(l => l.trim())
       .filter(Boolean)
-      .map((l) => {
-        try {
-          return JSON.parse(l);
-        } catch {
-          return null;
-        }
-      })
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
       .filter(Boolean);
   }
 }
 
-/** Load an existing line-per-entry file into a Set (preserves what we already have). */
-function loadExisting(path) {
+/**
+ * Parse a DAY-organised outreach file.
+ * Returns:
+ *   dayCount   — highest DAY number seen (0 if file is new / has no DAY lines)
+ *   allEntries — Set of every non-header line (used for deduplication)
+ *
+ * Migration: old flat-sorted files have no "DAY N" lines, so dayCount → 0
+ * and every existing entry lands in allEntries, preventing duplicates.
+ */
+function parseDayFile(path) {
+  let dayCount = 0;
+  const allEntries = new Set();
   try {
-    return new Set(
-      fs
-        .readFileSync(path, 'utf8')
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean)
-    );
+    for (const line of fs.readFileSync(path, 'utf8').split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      const m = t.match(/^DAY\s+(\d+)$/i);
+      if (m) {
+        dayCount = Math.max(dayCount, parseInt(m[1], 10));
+      } else {
+        allEntries.add(t);
+      }
+    }
   } catch {
-    return new Set();
+    // file doesn't exist yet — that's fine
   }
+  return { dayCount, allEntries };
 }
+
+// ── Validators ───────────────────────────────────────────────────────────────
+
+const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'];
+const EMAIL_RE   = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/;
+
+function isValidEmail(raw) {
+  if (!raw || typeof raw !== 'string') return false;
+  const e = raw.trim().toLowerCase();
+  if (e.length < 6 || e.length > 32)            return false;  // too short or > 32 chars
+  if (IMAGE_EXTS.some(ext => e.endsWith(ext)))   return false;  // ends with image ext
+  if (!EMAIL_RE.test(e))                          return false;  // fails format check
+  return true;
+}
+
+function isValidPhone(raw) {
+  if (!raw || typeof raw !== 'string') return false;
+  const digits = raw.replace(/\D/g, '');
+  return digits.length >= 7;  // at least 7 numeric digits
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 if (!fs.existsSync(file)) {
   console.error(`No results file at ${file} — nothing to extract.`);
@@ -60,33 +102,59 @@ if (!fs.existsSync(file)) {
 
 const rows = parseResults(fs.readFileSync(file, 'utf8'));
 
-const phones = loadExisting(WHATSAPP_FILE);
-const emails = loadExisting(GMAIL_FILE);
-let newPhones = 0;
-let newEmails = 0;
+const { dayCount: phoneDay, allEntries: seenPhones } = parseDayFile(WHATSAPP_FILE);
+const { dayCount: emailDay, allEntries: seenEmails } = parseDayFile(GMAIL_FILE);
+
+const newPhones = [];
+const newEmails = [];
+
+let skippedEmails = 0;
 
 for (const r of rows) {
+  // ── Phones ──
   const phone = (r.phone || '').toString().trim();
-  if (phone && !phones.has(phone)) {
-    phones.add(phone);
-    newPhones += 1;
+  if (isValidPhone(phone) && !seenPhones.has(phone)) {
+    seenPhones.add(phone);
+    newPhones.push(phone);
   }
 
-  const list = Array.isArray(r.emails) ? r.emails : r.email ? [r.email] : [];
+  // ── Emails ──
+  const list = Array.isArray(r.emails) ? r.emails
+             : r.email                 ? [r.email]
+             : [];
+
   for (const e of list) {
     const email = (e || '').toString().trim().toLowerCase();
-    if (email && !emails.has(email)) {
-      emails.add(email);
-      newEmails += 1;
+    if (!isValidEmail(email)) {
+      if (email) skippedEmails++;
+      continue;
     }
+    if (seenEmails.has(email)) continue;
+    seenEmails.add(email);
+    newEmails.push(email);
   }
 }
 
-// Write back, sorted for stable diffs.
-fs.writeFileSync(WHATSAPP_FILE, [...phones].sort().join('\n') + '\n');
-fs.writeFileSync(GMAIL_FILE, [...emails].sort().join('\n') + '\n');
+// ── Write day sections ───────────────────────────────────────────────────────
 
-console.error(
-  `Extracted ${rows.length} rows → +${newPhones} new phones (${phones.size} total in ${WHATSAPP_FILE}), ` +
-    `+${newEmails} new emails (${emails.size} total in ${GMAIL_FILE}).`
-);
+if (newPhones.length > 0) {
+  const day = phoneDay + 1;
+  fs.appendFileSync(WHATSAPP_FILE, `\nDAY ${day}\n${newPhones.join('\n')}\n`);
+  console.error(`✔ Phones: +${newPhones.length} new → DAY ${day} in ${WHATSAPP_FILE} (${seenPhones.size} total unique)`);
+} else {
+  console.error(`✘ Phones: no new numbers found this run.`);
+}
+
+if (newEmails.length > 0) {
+  const day = emailDay + 1;
+  fs.appendFileSync(GMAIL_FILE, `\nDAY ${day}\n${newEmails.join('\n')}\n`);
+  console.error(`✔ Emails: +${newEmails.length} new → DAY ${day} in ${GMAIL_FILE} (${seenEmails.size} total unique)`);
+} else {
+  console.error(`✘ Emails: no new emails found this run.`);
+}
+
+if (skippedEmails > 0) {
+  console.error(`  (dropped ${skippedEmails} emails — failed length/format/image-ext filter)`);
+}
+
+console.error(`\nSummary: processed ${rows.length} rows from ${file}`);

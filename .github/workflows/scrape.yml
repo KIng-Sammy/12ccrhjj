@@ -1,19 +1,34 @@
 name: Scrape restaurant leads
 
-# Walks the United States one state at a time (see scripts/us-states.js + the
-# committed state/progress.json pointer). Runs automatically 3x/day, and HARD
-# STOPS — disables itself — once the final state has been scraped.
+# Walks the world city by city: EVERY incorporated city/town in the United
+# States (all 50 states + D.C.), then — once the US is fully swept — every city
+# in MEXICO, writing Mexico's leads into their own freshly-created files.
+# Target order + datasets live in scripts/targets.js; the committed
+# state/progress.json holds the current index into that flat list.
+#
+# ── Schedule ──────────────────────────────────────────────────────────────────
+# Runs every 5 minutes — GitHub Actions' minimum interval. The concurrency
+# group (cancel-in-progress: false) ensures runs never overlap: a new trigger
+# queues behind the active run, giving near-zero idle time between scrapes.
+# Each run scrapes a BATCH of cities (default 25) so the ~110k-city sweep
+# finishes in a sane timeframe instead of years at one-city-per-run.
+#
+# NOTE for private repos: GitHub Actions free tier = 2 000 min/month.
+# Each run can use up to 120 min. Use a PUBLIC repo to run without limit.
+# ─────────────────────────────────────────────────────────────────────────────
 on:
   schedule:
-    # 3x a day (UTC): ~05:13, 13:13, 21:13. Off-the-hour on purpose.
-    - cron: '13 5,13,21 * * *'
-  # Still runnable on demand. Query is chosen automatically from progress.
+    - cron: '*/5 * * * *'   # every 5 minutes — maximum GitHub cron frequency
   workflow_dispatch:
     inputs:
+      batch:
+        description: 'Cities to scrape per run (more = faster sweep, longer runs)'
+        required: false
+        default: '25'
       depth:
         description: 'Scroll depth — higher = more results per query'
         required: false
-        default: '10'
+        default: '20'
       lang:
         description: 'Language code'
         required: false
@@ -23,25 +38,27 @@ on:
         required: false
         default: 'true'
 
-# Need to push the updated files (whatsapp.txt / gmail.txt / progress) and to
-# disable this workflow when the country is done.
 permissions:
   contents: write
   actions: write
 
-# Never let two runs overlap and corrupt the progress pointer.
+# Never let two runs overlap and corrupt the progress pointer or outreach files.
+# cancel-in-progress: false means a new trigger queues instead of cancelling,
+# so no scraping work is ever thrown away.
 concurrency:
-  group: scrape-us
+  group: scrape-world
   cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120          # 2-hour ceiling per run; scraper exits early on inactivity
     env:
-      DEPTH: ${{ github.event.inputs.depth || '10' }}
-      LANG_CODE: ${{ github.event.inputs.lang || 'en' }}
-      EMAIL: ${{ github.event.inputs.email || 'true' }}
+      BATCH:     ${{ github.event.inputs.batch || '25' }}
+      DEPTH:     ${{ github.event.inputs.depth || '20' }}
+      LANG_CODE: ${{ github.event.inputs.lang  || 'en' }}
+      EMAIL:     ${{ github.event.inputs.email || 'true' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,26 +68,28 @@ jobs:
         with:
           node-version: 20
 
-      - name: Pick next US state
+      # Picks the next BATCH of cities and WRITES queries.txt itself.
+      - name: Pick next batch of cities
         id: pick
-        run: node scripts/pick-state.js
+        run: node scripts/pick-target.js
 
-      # ── HARD STOP: every state already scraped ───────────────────────────────
-      - name: All states done — disable workflow (hard stop)
+      # ── HARD STOP: every city of every country already scraped ────────────────
+      - name: All targets done — disable workflow (hard stop)
         if: steps.pick.outputs.done == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "::notice::United States fully scraped. Disabling workflow (hard stop)."
+          echo "::notice::Every city in every country scraped. Disabling workflow (hard stop)."
           gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
             gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
 
-      # ── Normal run: scrape the current state ─────────────────────────────────
-      - name: Build query file
+      # ── Normal run: scrape the current batch ─────────────────────────────────
+      - name: Show batch
         if: steps.pick.outputs.done == 'false'
         run: |
-          echo "Target: ${{ steps.pick.outputs.state }} (index ${{ steps.pick.outputs.index }})"
-          echo "${{ steps.pick.outputs.query }}" > queries.txt
+          echo "Country: ${{ steps.pick.outputs.country }}"
+          echo "Batch:   ${{ steps.pick.outputs.count }} cities (index ${{ steps.pick.outputs.index }})"
+          echo "Outputs: ${{ steps.pick.outputs.phonesFile }} / ${{ steps.pick.outputs.emailsFile }}"
           echo "Queries:" && cat queries.txt
           mkdir -p out
 
@@ -88,7 +107,7 @@ jobs:
             -json \
             -depth "$DEPTH" \
             -lang "$LANG_CODE" \
-            -exit-on-inactivity 5m \
+            -exit-on-inactivity 10m \
             $EMAIL_FLAG
           echo "Result size:" && wc -c out/results.json || true
 
@@ -99,9 +118,9 @@ jobs:
       - name: Load leads into MongoDB (optional)
         if: steps.pick.outputs.done == 'false'
         env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB }}
-          LEADS_QUERY: ${{ steps.pick.outputs.query }}
+          MONGODB_URI:  ${{ secrets.MONGODB_URI }}
+          MONGODB_DB:   ${{ secrets.MONGODB_DB }}
+          LEADS_QUERY:  ${{ steps.pick.outputs.country }} (batch ${{ steps.pick.outputs.index }})
         run: |
           if [ -z "$MONGODB_URI" ]; then
             echo "MONGODB_URI not set — skipping MongoDB load."
@@ -109,25 +128,38 @@ jobs:
           fi
           node scripts/to-mongo.js out/results.json
 
-      - name: Extract phones → whatsapp.txt and emails → gmail.txt
+      # Appends a new "DAY N" section to the CURRENT country's outreach files.
+      # United States → whatsapp.txt / gmail.txt; Mexico → whatsapp-mexico.txt /
+      # gmail-mexico.txt (those new files are created automatically the first
+      # time a Mexico batch runs).
+      - name: Extract phones + emails (per-country files)
         if: steps.pick.outputs.done == 'false'
+        env:
+          PHONES_FILE: ${{ steps.pick.outputs.phonesFile }}
+          EMAILS_FILE: ${{ steps.pick.outputs.emailsFile }}
         run: node scripts/extract.js out/results.json
 
       - name: Advance progress pointer
         id: adv
         if: steps.pick.outputs.done == 'false'
+        env:
+          COUNT: ${{ steps.pick.outputs.count }}
         run: node scripts/advance.js
+
+      - name: Note country switch
+        if: steps.adv.outputs.newCountry != ''
+        run: echo "::notice::United States complete — now starting ${{ steps.adv.outputs.newCountry }} into its own files."
 
       - name: Commit outreach files + progress
         if: steps.pick.outputs.done == 'false'
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add whatsapp.txt gmail.txt state/progress.json
+          git add whatsapp*.txt gmail*.txt state/progress.json
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "leads: ${{ steps.pick.outputs.state }} (state ${{ steps.pick.outputs.index }})"
+            git commit -m "leads: ${{ steps.pick.outputs.country }} batch @ index ${{ steps.pick.outputs.index }} (+${{ steps.pick.outputs.count }} cities)"
             git push
           fi
 
@@ -135,16 +167,16 @@ jobs:
         if: always() && steps.pick.outputs.done == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: leads-${{ steps.pick.outputs.state || 'run' }}
+          name: leads-${{ steps.pick.outputs.label || 'run' }}
           path: out/results.json
           if-no-files-found: warn
 
-      # ── HARD STOP: that was the final state ──────────────────────────────────
-      - name: Last state finished — disable workflow (hard stop)
+      # ── HARD STOP: that batch finished the final country ──────────────────────
+      - name: Final country finished — disable workflow (hard stop)
         if: steps.adv.outputs.last == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "::notice::Final state (${{ steps.adv.outputs.finished }}) scraped. Disabling workflow (hard stop)."
+          echo "::notice::Final country (${{ steps.adv.outputs.finishedCountry }}) fully scraped. Disabling workflow (hard stop)."
           gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
             gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
