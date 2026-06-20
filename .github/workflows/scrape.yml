@@ -100,30 +100,45 @@ jobs:
         if: steps.pick.outputs.done == 'false'
         run: npm install --no-audit --no-fund
 
-      # Scrape ONE city per docker run. Each single-query job completes and
-      # flushes its results cleanly (the old multi-query run + -exit-on-inactivity
-      # raced and wrote 0 bytes). Every city is wrapped so it CANNOT fail the job:
+      # Scrape ONE city per docker run, then EXTRACT + ADVANCE + COMMIT+PUSH that
+      # single city before touching the next. Why per-city instead of per-batch:
+      # if the run is cut off (job timeout, runner death, quota), every city that
+      # already finished is durably saved & pushed — at most the one in-flight city
+      # is lost. Each single-query job also completes and flushes cleanly (the old
+      # multi-query run + -exit-on-inactivity raced and wrote 0 bytes).
+      #
+      # Every city is wrapped so it CANNOT fail the job:
       #   • `timeout` caps a slow/blocked city so it can't stall the batch
-      #   • `|| true` swallows timeouts, blocks, crashes, and zero-result exits
-      #   • empty output → just skip and move to the next city
-      # Whatever a city yields — nothing, a little, or a lot — we always advance.
-      # Each city's results are normalised to JSON-lines and accumulated so the
-      # whole batch is extracted/loaded ONCE below (one "DAY" section per run).
-      - name: Scrape each city (resilient — skip empties, never stall)
+      #   • `|| ...` swallows timeouts, blocks, crashes, zero-result exits
+      #   • empty output → skip, but STILL advance so we never repeat it
+      # Whatever a city yields — nothing, a little, or a lot — we save & move on.
+      - name: Scrape + save each city (durable, resilient)
+        id: sweep
         if: steps.pick.outputs.done == 'false'
+        env:
+          PHONES_FILE:  ${{ steps.pick.outputs.phonesFile }}
+          EMAILS_FILE:  ${{ steps.pick.outputs.emailsFile }}
+          MONGODB_URI:  ${{ secrets.MONGODB_URI }}
+          MONGODB_DB:   ${{ secrets.MONGODB_DB }}
+          LEADS_QUERY:  ${{ steps.pick.outputs.country }}
         run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p out
           : > out/results.jsonl
           EMAIL_FLAG=""
           [ "$EMAIL" = "true" ] && EMAIL_FLAG="-email"
           total=$(grep -c . queries.txt || echo 0)
           i=0
+          last_flag=false
           while IFS= read -r q; do
             [ -z "$q" ] && continue
             i=$((i + 1))
             echo "::group::[$i/$total] $q"
             printf '%s\n' "$q" > .one.txt
-            rm -f out/city.json
+            rm -f out/city.json out/city.jsonl
+
+            # ── scrape one city ──
             timeout "${CITY_TIMEOUT}s" docker run --rm \
               -v "$PWD/.one.txt:/q.txt:ro" \
               -v "$PWD/out:/out" \
@@ -131,8 +146,9 @@ jobs:
               -input /q.txt -results /out/city.json -json \
               -depth "$DEPTH" -lang "$LANG_CODE" $EMAIL_FLAG || \
               echo "  ⚠ city errored/timed out — skipping"
+
+            # ── normalise (JSON array OR json-lines) → one object per line ──
             if [ -s out/city.json ]; then
-              # Normalise (JSON array OR json-lines) → one object per line.
               node -e '
                 const fs=require("fs");
                 let t=fs.readFileSync(process.argv[1],"utf8").trim();
@@ -143,64 +159,39 @@ jobs:
                           .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean); }
                 for (const o of arr) fs.appendFileSync(process.argv[2], JSON.stringify(o)+"\n");
                 console.error("  ✔ "+arr.length+" places");
-              ' out/city.json out/results.jsonl || echo "  ⚠ parse failed — skipping"
+              ' out/city.json out/city.jsonl || echo "  ⚠ parse failed"
+            fi
+
+            # ── save this city's leads (per-country files + optional Mongo) ──
+            if [ -s out/city.jsonl ]; then
+              node scripts/extract.js out/city.jsonl || true
+              [ -n "$MONGODB_URI" ] && node scripts/to-mongo.js out/city.jsonl || true
+              cat out/city.jsonl >> out/results.jsonl
             else
               echo "  ✘ no results"
             fi
+
+            # ── advance pointer by this ONE city (GITHUB_OUTPUT unset so the loop
+            #    doesn't spam step outputs; we parse its stdout instead) ──
+            adv="$(GITHUB_OUTPUT='' node scripts/advance.js 2>&1)"; echo "$adv"
+            echo "$adv" | grep -q '^last=true' && last_flag=true
+            if echo "$adv" | grep -qE '^newCountry=[A-Za-z]'; then
+              nc="$(echo "$adv" | sed -n 's/^newCountry=//p')"
+              echo "::notice::A country just completed — now starting ${nc} into its own files."
+            fi
+
+            # ── durably commit + push this city before moving on ──
+            git add whatsapp*.txt gmail*.txt state/progress.json
+            if ! git diff --cached --quiet; then
+              git commit -q -m "leads: ${LEADS_QUERY} — ${q}"
+              git push -q || { git pull --rebase --autostash -q && git push -q; } || \
+                echo "  ⚠ push failed — will retry on next city"
+            fi
             echo "::endgroup::"
           done < queries.txt
-          rm -f .one.txt out/city.json
-          echo "Batch total places:" && wc -l < out/results.jsonl
-
-      # Appends ONE new "DAY N" section (this run's new entries) to the CURRENT
-      # country's files. US → whatsapp.txt / gmail.txt; Mexico → whatsapp-mexico.txt
-      # / gmail-mexico.txt (created automatically on the first Mexico batch).
-      - name: Extract phones + emails (per-country files)
-        if: steps.pick.outputs.done == 'false'
-        env:
-          PHONES_FILE: ${{ steps.pick.outputs.phonesFile }}
-          EMAILS_FILE: ${{ steps.pick.outputs.emailsFile }}
-        run: node scripts/extract.js out/results.jsonl || true
-
-      - name: Load leads into MongoDB (optional)
-        if: steps.pick.outputs.done == 'false'
-        env:
-          MONGODB_URI:  ${{ secrets.MONGODB_URI }}
-          MONGODB_DB:   ${{ secrets.MONGODB_DB }}
-          LEADS_QUERY:  ${{ steps.pick.outputs.country }} (batch ${{ steps.pick.outputs.index }})
-        run: |
-          if [ -z "$MONGODB_URI" ]; then
-            echo "MONGODB_URI not set — skipping MongoDB load."
-            exit 0
-          fi
-          node scripts/to-mongo.js out/results.jsonl || true
-
-      # Advance + commit run even if something above hiccuped (always() guard),
-      # as long as there was a real batch to process. This is what guarantees the
-      # progress pointer ALWAYS moves forward → the same cities are never redone.
-      - name: Advance progress pointer
-        id: adv
-        if: ${{ always() && steps.pick.outputs.done == 'false' }}
-        env:
-          COUNT: ${{ steps.pick.outputs.count }}
-        run: node scripts/advance.js
-
-      - name: Note country switch
-        if: ${{ always() && steps.adv.outputs.newCountry != '' }}
-        run: echo "::notice::United States complete — now starting ${{ steps.adv.outputs.newCountry }} into its own files."
-
-      - name: Commit outreach files + progress
-        if: ${{ always() && steps.pick.outputs.done == 'false' }}
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add whatsapp*.txt gmail*.txt state/progress.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "leads: ${{ steps.pick.outputs.country }} batch @ index ${{ steps.pick.outputs.index }} (+${{ steps.pick.outputs.count }} cities)"
-            git push
-          fi
+          rm -f .one.txt out/city.json out/city.jsonl
+          echo "Run total places:" && wc -l < out/results.jsonl || true
+          echo "last=${last_flag}" >> "$GITHUB_OUTPUT"
 
       - name: Upload raw results (download)
         if: ${{ always() && steps.pick.outputs.done == 'false' }}
@@ -212,10 +203,10 @@ jobs:
 
       # ── HARD STOP: that batch finished the final country ──────────────────────
       - name: Final country finished — disable workflow (hard stop)
-        if: steps.adv.outputs.last == 'true'
+        if: steps.sweep.outputs.last == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "::notice::Final country (${{ steps.adv.outputs.finishedCountry }}) fully scraped. Disabling workflow (hard stop)."
+          echo "::notice::Final country fully scraped. Disabling workflow (hard stop)."
           gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
             gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
