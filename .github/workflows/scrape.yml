@@ -52,12 +52,16 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120          # 2-hour ceiling per run; scraper exits early on inactivity
+    timeout-minutes: 120          # 2-hour ceiling per run
     env:
-      BATCH:     ${{ github.event.inputs.batch || '25' }}
-      DEPTH:     ${{ github.event.inputs.depth || '20' }}
-      LANG_CODE: ${{ github.event.inputs.lang  || 'en' }}
-      EMAIL:     ${{ github.event.inputs.email || 'true' }}
+      BATCH:        ${{ github.event.inputs.batch || '15' }}
+      DEPTH:        ${{ github.event.inputs.depth || '20' }}
+      LANG_CODE:    ${{ github.event.inputs.lang  || 'en' }}
+      EMAIL:        ${{ github.event.inputs.email || 'true' }}
+      # Per-city hard cap (seconds). BATCH × CITY_TIMEOUT must stay under the
+      # 120-min job ceiling so the Advance/Commit steps always run → no repeats.
+      # 15 × 300s = 75 min worst case.
+      CITY_TIMEOUT: '300'
 
     steps:
       - name: Checkout
@@ -91,29 +95,72 @@ jobs:
           echo "Batch:   ${{ steps.pick.outputs.count }} cities (index ${{ steps.pick.outputs.index }})"
           echo "Outputs: ${{ steps.pick.outputs.phonesFile }} / ${{ steps.pick.outputs.emailsFile }}"
           echo "Queries:" && cat queries.txt
-          mkdir -p out
-
-      - name: Run Google Maps scraper
-        if: steps.pick.outputs.done == 'false'
-        run: |
-          EMAIL_FLAG=""
-          if [ "$EMAIL" = "true" ]; then EMAIL_FLAG="-email"; fi
-          docker run --rm \
-            -v "$PWD/queries.txt:/queries.txt:ro" \
-            -v "$PWD/out:/out" \
-            gosom/google-maps-scraper \
-            -input /queries.txt \
-            -results /out/results.json \
-            -json \
-            -depth "$DEPTH" \
-            -lang "$LANG_CODE" \
-            -exit-on-inactivity 10m \
-            $EMAIL_FLAG
-          echo "Result size:" && wc -c out/results.json || true
 
       - name: Install loader deps
         if: steps.pick.outputs.done == 'false'
         run: npm install --no-audit --no-fund
+
+      # Scrape ONE city per docker run. Each single-query job completes and
+      # flushes its results cleanly (the old multi-query run + -exit-on-inactivity
+      # raced and wrote 0 bytes). Every city is wrapped so it CANNOT fail the job:
+      #   • `timeout` caps a slow/blocked city so it can't stall the batch
+      #   • `|| true` swallows timeouts, blocks, crashes, and zero-result exits
+      #   • empty output → just skip and move to the next city
+      # Whatever a city yields — nothing, a little, or a lot — we always advance.
+      # Each city's results are normalised to JSON-lines and accumulated so the
+      # whole batch is extracted/loaded ONCE below (one "DAY" section per run).
+      - name: Scrape each city (resilient — skip empties, never stall)
+        if: steps.pick.outputs.done == 'false'
+        run: |
+          mkdir -p out
+          : > out/results.jsonl
+          EMAIL_FLAG=""
+          [ "$EMAIL" = "true" ] && EMAIL_FLAG="-email"
+          total=$(grep -c . queries.txt || echo 0)
+          i=0
+          while IFS= read -r q; do
+            [ -z "$q" ] && continue
+            i=$((i + 1))
+            echo "::group::[$i/$total] $q"
+            printf '%s\n' "$q" > .one.txt
+            rm -f out/city.json
+            timeout "${CITY_TIMEOUT}s" docker run --rm \
+              -v "$PWD/.one.txt:/q.txt:ro" \
+              -v "$PWD/out:/out" \
+              gosom/google-maps-scraper \
+              -input /q.txt -results /out/city.json -json \
+              -depth "$DEPTH" -lang "$LANG_CODE" $EMAIL_FLAG || \
+              echo "  ⚠ city errored/timed out — skipping"
+            if [ -s out/city.json ]; then
+              # Normalise (JSON array OR json-lines) → one object per line.
+              node -e '
+                const fs=require("fs");
+                let t=fs.readFileSync(process.argv[1],"utf8").trim();
+                if(!t) process.exit(0);
+                let arr;
+                try { const p=JSON.parse(t); arr=Array.isArray(p)?p:[p]; }
+                catch { arr=t.split("\n").map(l=>l.trim()).filter(Boolean)
+                          .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean); }
+                for (const o of arr) fs.appendFileSync(process.argv[2], JSON.stringify(o)+"\n");
+                console.error("  ✔ "+arr.length+" places");
+              ' out/city.json out/results.jsonl || echo "  ⚠ parse failed — skipping"
+            else
+              echo "  ✘ no results"
+            fi
+            echo "::endgroup::"
+          done < queries.txt
+          rm -f .one.txt out/city.json
+          echo "Batch total places:" && wc -l < out/results.jsonl
+
+      # Appends ONE new "DAY N" section (this run's new entries) to the CURRENT
+      # country's files. US → whatsapp.txt / gmail.txt; Mexico → whatsapp-mexico.txt
+      # / gmail-mexico.txt (created automatically on the first Mexico batch).
+      - name: Extract phones + emails (per-country files)
+        if: steps.pick.outputs.done == 'false'
+        env:
+          PHONES_FILE: ${{ steps.pick.outputs.phonesFile }}
+          EMAILS_FILE: ${{ steps.pick.outputs.emailsFile }}
+        run: node scripts/extract.js out/results.jsonl || true
 
       - name: Load leads into MongoDB (optional)
         if: steps.pick.outputs.done == 'false'
@@ -126,32 +173,24 @@ jobs:
             echo "MONGODB_URI not set — skipping MongoDB load."
             exit 0
           fi
-          node scripts/to-mongo.js out/results.json
+          node scripts/to-mongo.js out/results.jsonl || true
 
-      # Appends a new "DAY N" section to the CURRENT country's outreach files.
-      # United States → whatsapp.txt / gmail.txt; Mexico → whatsapp-mexico.txt /
-      # gmail-mexico.txt (those new files are created automatically the first
-      # time a Mexico batch runs).
-      - name: Extract phones + emails (per-country files)
-        if: steps.pick.outputs.done == 'false'
-        env:
-          PHONES_FILE: ${{ steps.pick.outputs.phonesFile }}
-          EMAILS_FILE: ${{ steps.pick.outputs.emailsFile }}
-        run: node scripts/extract.js out/results.json
-
+      # Advance + commit run even if something above hiccuped (always() guard),
+      # as long as there was a real batch to process. This is what guarantees the
+      # progress pointer ALWAYS moves forward → the same cities are never redone.
       - name: Advance progress pointer
         id: adv
-        if: steps.pick.outputs.done == 'false'
+        if: ${{ always() && steps.pick.outputs.done == 'false' }}
         env:
           COUNT: ${{ steps.pick.outputs.count }}
         run: node scripts/advance.js
 
       - name: Note country switch
-        if: steps.adv.outputs.newCountry != ''
+        if: ${{ always() && steps.adv.outputs.newCountry != '' }}
         run: echo "::notice::United States complete — now starting ${{ steps.adv.outputs.newCountry }} into its own files."
 
       - name: Commit outreach files + progress
-        if: steps.pick.outputs.done == 'false'
+        if: ${{ always() && steps.pick.outputs.done == 'false' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -164,11 +203,11 @@ jobs:
           fi
 
       - name: Upload raw results (download)
-        if: always() && steps.pick.outputs.done == 'false'
+        if: ${{ always() && steps.pick.outputs.done == 'false' }}
         uses: actions/upload-artifact@v4
         with:
           name: leads-${{ steps.pick.outputs.label || 'run' }}
-          path: out/results.json
+          path: out/results.jsonl
           if-no-files-found: warn
 
       # ── HARD STOP: that batch finished the final country ──────────────────────
