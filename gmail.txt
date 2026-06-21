@@ -980,3 +980,10 @@ john@doe.com
 
 DAY 84
 info@destinationgrille.com
+
+DAY 85
+giftshop@sea-n-suds.com
+info@beachhousegs.com
+biz@thesloop.biz
+sales@gulfshoresseafood.com
+info@shippsdockside.com
