@@ -896,3 +896,6 @@ bookings@cornerbistro.cafe
 
 DAY 65
 info@epicebirmingham.com
+
+DAY 66
+jtabor@regency-prop.com
