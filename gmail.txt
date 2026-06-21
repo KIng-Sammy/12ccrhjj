@@ -705,3 +705,6 @@ email@email.com
 sonia@bertolones.com
 example@email.com
 fuegobitess@gmail.com
+
+DAY 34
+info@thewaverlylocal.com
