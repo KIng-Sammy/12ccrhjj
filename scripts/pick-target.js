@@ -1,32 +1,35 @@
 /**
- * Decide what to scrape on this run (city-level walk).
+ * Decide what to scrape on this run and write a per-city PLAN to batch.json.
  *
- * Reads state/progress.json ({ "index": N }) and takes a BATCH of targets
- * starting at N from the flat US→Mexico list (scripts/targets.js). Because there
- * are ~110k cities, scraping one-per-run would take years; we feed several
- * cities per run as multiple queries. The batch is CLAMPED to a single country
- * so the output files for the run are unambiguous.
+ * Reads state/progress.json ({ "index": N }) and assembles the next unit of work
+ * from the flat US→Mexico list (scripts/targets.js):
  *
- * Writes queries.txt (one query per line) and emits GitHub Actions outputs:
- *   done        - "true" when every target has been processed (HARD STOP signal)
- *   index       - start index of this batch
- *   count       - how many targets are in this batch
- *   country     - the country this batch belongs to
- *   phonesFile  - output file for phone numbers this run
- *   emailsFile  - output file for emails this run
- *   label       - short human label for logs / artifact naming
+ *   • If targets[N] is a BIG city (pop >= BIG_CITY_MIN), the run handles JUST
+ *     that one city — but with its full set of category sub-queries (general +
+ *     cuisines) so it blows past Google's ~120-per-search cap. One big city per
+ *     run keeps the run under the 2-hour ceiling.
+ *   • Otherwise the run packs a batch of consecutive SMALL cities (up to BATCH),
+ *     each with its single "restaurants in <city>" query. The batch stops at a
+ *     country boundary or the first big city so a run is always one country and
+ *     never mixes big+small.
  *
- * Env:
- *   BATCH - how many cities to scrape per run (default 25)
+ * batch.json shape:
+ *   {
+ *     country, phones, emails,
+ *     cities: [ { index, city, state, pop, big, queries: [...] }, ... ]
+ *   }
  *
- * If state/progress.json is missing, we start at index 0.
+ * Emits GitHub Actions outputs: done, index, count (cities), country,
+ * phonesFile, emailsFile, label.
+ *
+ * Env: BATCH (small-city cities per run, default 15), BIG_CITY_MIN (default 50000).
  */
 import fs from 'node:fs';
-import { loadTargets, queryFor, filesFor } from './targets.js';
+import { loadTargets, queriesFor, filesFor, isBig } from './targets.js';
 
 const PROGRESS_FILE = 'state/progress.json';
-const QUERIES_FILE = 'queries.txt';
-const BATCH = Math.max(1, parseInt(process.env.BATCH || '25', 10) || 25);
+const BATCH_FILE = 'batch.json';
+const BATCH = Math.max(1, parseInt(process.env.BATCH || '15', 10) || 15);
 
 function readIndex() {
   try {
@@ -52,33 +55,59 @@ if (index >= targets.length) {
   process.exit(0);
 }
 
-// Take up to BATCH targets, but stop at a country boundary so the run writes to
-// exactly one country's output files.
 const country = targets[index].country;
-const batch = [];
-for (let i = index; i < targets.length && batch.length < BATCH; i++) {
-  if (targets[i].country !== country) break;
-  batch.push(targets[i]);
+const cities = [];
+
+if (isBig(targets[index])) {
+  // Big city → its own run with all category sub-queries.
+  cities.push(index);
+} else {
+  // Pack consecutive small cities, same country, stop before any big city.
+  for (let i = index; i < targets.length && cities.length < BATCH; i++) {
+    if (targets[i].country !== country) break;
+    if (isBig(targets[i])) break;
+    cities.push(i);
+  }
 }
 
-fs.writeFileSync(QUERIES_FILE, batch.map(queryFor).join('\n') + '\n');
+const files = filesFor(country);
+const plan = {
+  country,
+  phones: files.phones,
+  emails: files.emails,
+  cities: cities.map(i => {
+    const t = targets[i];
+    return {
+      index: i,
+      city: t.city,
+      state: t.state,
+      pop: t.pop,
+      big: isBig(t),
+      queries: queriesFor(t),
+    };
+  }),
+};
 
-const { phones, emails } = filesFor(country);
-const first = batch[0];
-const last = batch[batch.length - 1];
-const label = `${country}-${index}-${index + batch.length - 1}`;
+fs.writeFileSync(BATCH_FILE, JSON.stringify(plan, null, 2) + '\n');
+
+const totalQueries = plan.cities.reduce((n, c) => n + c.queries.length, 0);
+const first = targets[cities[0]];
+const last = targets[cities[cities.length - 1]];
+const label = `${country}-${index}-${index + cities.length - 1}`;
 
 emit({
   done: 'false',
   index,
-  count: batch.length,
+  count: cities.length,
   country,
-  phonesFile: phones,
-  emailsFile: emails,
+  phonesFile: plan.phones,
+  emailsFile: plan.emails,
   label,
 });
 
 console.error(
-  `Batch: ${batch.length} ${country} cities, idx ${index}..${index + batch.length - 1} ` +
+  `Plan: ${cities.length} ${country} ${cities.length === 1 && plan.cities[0].big ? 'BIG ' : ''}` +
+  `cit${cities.length === 1 ? 'y' : 'ies'}, ${totalQueries} quer${totalQueries === 1 ? 'y' : 'ies'}, ` +
+  `idx ${index}..${index + cities.length - 1} ` +
   `(${first.city}, ${first.state} → ${last.city}, ${last.state}) of ${targets.length} total`
 );

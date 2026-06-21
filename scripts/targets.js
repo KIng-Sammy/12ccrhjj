@@ -5,15 +5,22 @@
  * from that country's dataset (built from public sources):
  *   - us-cities.json — every incorporated city/town in the 50 states + D.C.
  *                      (US Census 2023 Gazetteer, FUNCSTAT=A; Hawaii/D.C. via CDP
- *                      fallback). ~19,600 places, all 51 covered.
+ *                      fallback). Populations joined from GeoNames US. ~19,600.
  *   - mx-cities.json — populated places across all 32 Mexican states
- *                      (GeoNames MX dump, class P with population or admin seat).
+ *                      (GeoNames MX dump). ~91,000. Each carries a population.
  *
- * The workflow processes these sequentially (tracked in state/progress.json) and
- * HARD STOPS once the final target of the final country has been scraped.
+ * Each record is { city, state, pop }. The workflow processes targets
+ * sequentially (tracked in state/progress.json) and HARD STOPS once the final
+ * target of the final country has been scraped.
  *
- * To queue MORE countries after Mexico, drop another <cc>-cities.json next to this
- * file and add an entry to COUNTRY_ORDER — nothing else needs to change.
+ * BIG CITIES (pop >= BIG_CITY_MIN) get MORE than Google's ~120-per-search cap:
+ * instead of one "restaurants in X" query we run one search per category
+ * (general + many cuisines). Each search returns its own batch; results are
+ * merged and de-duplicated downstream, so a big city yields hundreds–thousands
+ * of unique places instead of ~120.
+ *
+ * To queue MORE countries after Mexico, drop another <cc>-cities.json next to
+ * this file and add an entry to COUNTRY_ORDER — nothing else needs to change.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,11 +34,30 @@ export const COUNTRY_ORDER = [
   { country: 'Mexico', file: 'mx-cities.json' },
 ];
 
+/** A city counts as "big" (gets category sub-queries) at/above this population. */
+export const BIG_CITY_MIN = Math.max(0, parseInt(process.env.BIG_CITY_MIN || '50000', 10) || 50000);
+
+/**
+ * Search categories used to break past Google's ~120-per-search limit in big
+ * cities. The first ('restaurants') is the general sweep; the rest are cuisine /
+ * type facets, each a separate search. ~20 searches → up to a few thousand
+ * unique places before de-duplication.
+ */
+export const CATEGORIES = [
+  'restaurants',
+  'italian restaurants', 'chinese restaurants', 'mexican restaurants',
+  'indian restaurants', 'thai restaurants', 'japanese restaurants',
+  'korean restaurants', 'vietnamese restaurants', 'mediterranean restaurants',
+  'pizza', 'seafood restaurants', 'steakhouse', 'barbecue restaurants',
+  'burger restaurants', 'fast food', 'cafes', 'bakeries', 'bars',
+  'breakfast restaurants',
+];
+
 function load(file) {
   return JSON.parse(fs.readFileSync(path.join(__dirname, file), 'utf8'));
 }
 
-/** Flat ordered array of { city, state, country }. */
+/** Flat ordered array of { city, state, country, pop }. */
 export function loadTargets() {
   const all = [];
   for (const c of COUNTRY_ORDER) {
@@ -43,17 +69,29 @@ export function loadTargets() {
       continue;
     }
     for (const r of cities) {
-      all.push({ city: r.city, state: r.state || '', country: c.country });
+      all.push({ city: r.city, state: r.state || '', country: c.country, pop: r.pop || 0 });
     }
   }
   return all;
 }
 
-/** Build the Google Maps search query for one target. */
-export function queryFor(t) {
-  return t.state
-    ? `restaurants in ${t.city}, ${t.state}, ${t.country}`
-    : `restaurants in ${t.city}, ${t.country}`;
+/** Is this target a "big" city that should get category sub-queries? */
+export function isBig(t, min = BIG_CITY_MIN) {
+  return (t.pop || 0) >= min;
+}
+
+function place(t) {
+  return t.state ? `${t.city}, ${t.state}, ${t.country}` : `${t.city}, ${t.country}`;
+}
+
+/**
+ * All Google Maps search queries for ONE city.
+ *   • small city → a single "restaurants in <place>" query
+ *   • big city   → one query per CATEGORY (general + cuisines), to exceed ~120
+ */
+export function queriesFor(t, min = BIG_CITY_MIN) {
+  if (isBig(t, min)) return CATEGORIES.map(cat => `${cat} in ${place(t)}`);
+  return [`restaurants in ${place(t)}`];
 }
 
 /**

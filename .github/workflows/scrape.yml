@@ -58,10 +58,11 @@ jobs:
       DEPTH:        ${{ github.event.inputs.depth || '20' }}
       LANG_CODE:    ${{ github.event.inputs.lang  || 'en' }}
       EMAIL:        ${{ github.event.inputs.email || 'true' }}
-      # Per-city hard cap (seconds). BATCH × CITY_TIMEOUT must stay under the
-      # 120-min job ceiling so the Advance/Commit steps always run → no repeats.
-      # 15 × 300s = 75 min worst case.
+      # Per-QUERY hard cap (seconds). A big city runs ~20 category queries on its
+      # own; 20 × 300s = 100 min stays under the 120-min ceiling so Advance/Commit
+      # always run. Small-city runs do BATCH quick single-query cities.
       CITY_TIMEOUT: '300'
+      BIG_CITY_MIN: '50000'   # pop ≥ this ⇒ category sub-queries (tune to go deeper/faster)
 
     steps:
       - name: Checkout
@@ -72,8 +73,8 @@ jobs:
         with:
           node-version: 20
 
-      # Picks the next BATCH of cities and WRITES queries.txt itself.
-      - name: Pick next batch of cities
+      # Plans the next unit of work and WRITES batch.json (per-city query lists).
+      - name: Pick next cities
         id: pick
         run: node scripts/pick-target.js
 
@@ -87,32 +88,32 @@ jobs:
           gh workflow disable "Scrape restaurant leads" --repo "$GITHUB_REPOSITORY" || \
             gh workflow disable scrape.yml --repo "$GITHUB_REPOSITORY"
 
-      # ── Normal run: scrape the current batch ─────────────────────────────────
-      - name: Show batch
+      # ── Normal run: scrape the planned cities ────────────────────────────────
+      - name: Show plan
         if: steps.pick.outputs.done == 'false'
         run: |
           echo "Country: ${{ steps.pick.outputs.country }}"
-          echo "Batch:   ${{ steps.pick.outputs.count }} cities (index ${{ steps.pick.outputs.index }})"
+          echo "Cities:  ${{ steps.pick.outputs.count }} (start index ${{ steps.pick.outputs.index }})"
           echo "Outputs: ${{ steps.pick.outputs.phonesFile }} / ${{ steps.pick.outputs.emailsFile }}"
-          echo "Queries:" && cat queries.txt
+          jq -r '.cities[] | "  • \(.city), \(.state)  [pop \(.pop)]  \(.queries|length) quer\(if (.queries|length)==1 then "y" else "ies" end)\(if .big then "  (BIG)" else "" end)"' batch.json
 
       - name: Install loader deps
         if: steps.pick.outputs.done == 'false'
         run: npm install --no-audit --no-fund
 
-      # Scrape ONE city per docker run, then EXTRACT + ADVANCE + COMMIT+PUSH that
-      # single city before touching the next. Why per-city instead of per-batch:
-      # if the run is cut off (job timeout, runner death, quota), every city that
-      # already finished is durably saved & pushed — at most the one in-flight city
-      # is lost. Each single-query job also completes and flushes cleanly (the old
-      # multi-query run + -exit-on-inactivity raced and wrote 0 bytes).
+      # For each planned city: run ALL its queries (1 for a small city, ~20 for a
+      # big one), MERGE + de-dup that city's places, then EXTRACT + ADVANCE +
+      # COMMIT+PUSH that single city before touching the next. Why per-city:
+      # if the run is cut off (job timeout, runner death, quota), every finished
+      # city is durably saved & pushed — at most the one in-flight city is lost.
       #
-      # Every city is wrapped so it CANNOT fail the job:
-      #   • `timeout` caps a slow/blocked city so it can't stall the batch
+      # Each single-query docker run completes and flushes cleanly. Everything is
+      # wrapped so nothing can fail the job:
+      #   • `timeout` caps a slow/blocked query so it can't stall the run
       #   • `|| ...` swallows timeouts, blocks, crashes, zero-result exits
-      #   • empty output → skip, but STILL advance so we never repeat it
-      # Whatever a city yields — nothing, a little, or a lot — we save & move on.
-      - name: Scrape + save each city (durable, resilient)
+      #   • empty city → skip, but STILL advance so we never repeat it
+      # Whatever a city yields — nothing, a little, or thousands — we save & move on.
+      - name: Scrape + save each city (durable, big-city sub-queries)
         id: sweep
         if: steps.pick.outputs.done == 'false'
         env:
@@ -128,42 +129,57 @@ jobs:
           : > out/results.jsonl
           EMAIL_FLAG=""
           [ "$EMAIL" = "true" ] && EMAIL_FLAG="-email"
-          total=$(grep -c . queries.txt || echo 0)
-          i=0
+          ncities=$(jq '.cities | length' batch.json)
           last_flag=false
-          while IFS= read -r q; do
-            [ -z "$q" ] && continue
-            i=$((i + 1))
-            echo "::group::[$i/$total] $q"
-            printf '%s\n' "$q" > .one.txt
-            rm -f out/city.json out/city.jsonl
+          for ci in $(seq 0 $((ncities - 1))); do
+            city=$(jq -r ".cities[$ci].city" batch.json)
+            state=$(jq -r ".cities[$ci].state" batch.json)
+            nq=$(jq ".cities[$ci].queries | length" batch.json)
+            echo "::group::[$((ci + 1))/$ncities] $city, $state  ($nq quer$([ "$nq" -eq 1 ] && echo y || echo ies))"
+            : > out/city.jsonl
 
-            # ── scrape one city ──
-            timeout "${CITY_TIMEOUT}s" docker run --rm \
-              -v "$PWD/.one.txt:/q.txt:ro" \
-              -v "$PWD/out:/out" \
-              gosom/google-maps-scraper \
-              -input /q.txt -results /out/city.json -json \
-              -depth "$DEPTH" -lang "$LANG_CODE" $EMAIL_FLAG || \
-              echo "  ⚠ city errored/timed out — skipping"
+            # ── run every query for this city ──
+            for qi in $(seq 0 $((nq - 1))); do
+              q=$(jq -r ".cities[$ci].queries[$qi]" batch.json)
+              echo "  → $q"
+              printf '%s\n' "$q" > .one.txt
+              rm -f out/q.json
+              timeout "${CITY_TIMEOUT}s" docker run --rm \
+                -v "$PWD/.one.txt:/q.txt:ro" \
+                -v "$PWD/out:/out" \
+                gosom/google-maps-scraper \
+                -input /q.txt -results /out/q.json -json \
+                -depth "$DEPTH" -lang "$LANG_CODE" $EMAIL_FLAG || \
+                echo "    ⚠ query errored/timed out — skipping"
+              # normalise (JSON array OR json-lines) → one object per line, append
+              if [ -s out/q.json ]; then
+                node -e '
+                  const fs=require("fs");
+                  let t=fs.readFileSync(process.argv[1],"utf8").trim();
+                  if(!t) process.exit(0);
+                  let arr;
+                  try { const p=JSON.parse(t); arr=Array.isArray(p)?p:[p]; }
+                  catch { arr=t.split("\n").map(l=>l.trim()).filter(Boolean)
+                            .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean); }
+                  for (const o of arr) fs.appendFileSync(process.argv[2], JSON.stringify(o)+"\n");
+                ' out/q.json out/city.jsonl || echo "    ⚠ parse failed"
+              fi
+            done
 
-            # ── normalise (JSON array OR json-lines) → one object per line ──
-            if [ -s out/city.json ]; then
+            # ── merge: de-dup this city's places (multi-category overlap) ──
+            if [ -s out/city.jsonl ]; then
               node -e '
                 const fs=require("fs");
-                let t=fs.readFileSync(process.argv[1],"utf8").trim();
-                if(!t) process.exit(0);
-                let arr;
-                try { const p=JSON.parse(t); arr=Array.isArray(p)?p:[p]; }
-                catch { arr=t.split("\n").map(l=>l.trim()).filter(Boolean)
-                          .map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean); }
-                for (const o of arr) fs.appendFileSync(process.argv[2], JSON.stringify(o)+"\n");
-                console.error("  ✔ "+arr.length+" places");
-              ' out/city.json out/city.jsonl || echo "  ⚠ parse failed"
-            fi
-
-            # ── save this city's leads (per-country files + optional Mongo) ──
-            if [ -s out/city.jsonl ]; then
+                const seen=new Set(); const o=[];
+                for (const line of fs.readFileSync(process.argv[1],"utf8").split("\n")) {
+                  const t=line.trim(); if(!t) continue;
+                  let r; try{ r=JSON.parse(t) }catch{ continue }
+                  const k=r.place_id||r.cid||((r.title||r.name||"")+"|"+(r.address||""));
+                  if(seen.has(k)) continue; seen.add(k); o.push(JSON.stringify(r));
+                }
+                fs.writeFileSync(process.argv[1], o.join("\n")+"\n");
+                console.error("  ✔ "+o.length+" unique places this city");
+              ' out/city.jsonl || true
               node scripts/extract.js out/city.jsonl || true
               [ -n "$MONGODB_URI" ] && node scripts/to-mongo.js out/city.jsonl || true
               cat out/city.jsonl >> out/results.jsonl
@@ -183,14 +199,14 @@ jobs:
             # ── durably commit + push this city before moving on ──
             git add whatsapp*.txt gmail*.txt state/progress.json
             if ! git diff --cached --quiet; then
-              git commit -q -m "leads: ${LEADS_QUERY} — ${q}"
+              git commit -q -m "leads: ${LEADS_QUERY} — ${city}, ${state}"
               git push -q || { git pull --rebase --autostash -q && git push -q; } || \
                 echo "  ⚠ push failed — will retry on next city"
             fi
             echo "::endgroup::"
-          done < queries.txt
-          rm -f .one.txt out/city.json out/city.jsonl
-          echo "Run total places:" && wc -l < out/results.jsonl || true
+          done
+          rm -f .one.txt out/q.json out/city.jsonl
+          echo "Run total places (pre global de-dup):" && wc -l < out/results.jsonl || true
           echo "last=${last_flag}" >> "$GITHUB_OUTPUT"
 
       - name: Upload raw results (download)

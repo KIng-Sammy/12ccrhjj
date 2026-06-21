@@ -1,5 +1,8 @@
 node_modules/
 out/
 results.json
+results.jsonl
 queries.txt
+batch.json
+.one.txt
 .env

@@ -93,6 +93,26 @@ function isValidPhone(raw) {
   return digits.length >= 7;  // at least 7 numeric digits
 }
 
+/**
+ * PROJECT-WIDE dedup: collect every entry already present in ANY sibling output
+ * file matching `prefix` (e.g. all `whatsapp*.txt`, all `gmail*.txt`). This
+ * guarantees a phone/email is never written twice anywhere in the project —
+ * even across the US and Mexico files. Returns a Set of existing entries.
+ */
+function collectAcrossFiles(prefix) {
+  const seen = new Set();
+  let dir = [];
+  try { dir = fs.readdirSync('.'); } catch { /* ignore */ }
+  for (const name of dir) {
+    if (!name.startsWith(prefix) || !name.endsWith('.txt')) continue;
+    for (const line of fs.readFileSync(name, 'utf8').split('\n')) {
+      const t = line.trim();
+      if (t && !/^DAY\s+\d+$/i.test(t)) seen.add(t);
+    }
+  }
+  return seen;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 if (!fs.existsSync(file)) {
@@ -102,8 +122,12 @@ if (!fs.existsSync(file)) {
 
 const rows = parseResults(fs.readFileSync(file, 'utf8'));
 
-const { dayCount: phoneDay, allEntries: seenPhones } = parseDayFile(WHATSAPP_FILE);
-const { dayCount: emailDay, allEntries: seenEmails } = parseDayFile(GMAIL_FILE);
+// DAY counter comes from the target file; the seen-sets span ALL sibling files
+// so nothing is ever duplicated project-wide.
+const { dayCount: phoneDay } = parseDayFile(WHATSAPP_FILE);
+const { dayCount: emailDay } = parseDayFile(GMAIL_FILE);
+const seenPhones = collectAcrossFiles('whatsapp');
+const seenEmails = collectAcrossFiles('gmail');
 
 const newPhones = [];
 const newEmails = [];
